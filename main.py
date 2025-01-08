@@ -8,6 +8,7 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Set
 from jose import JWTError, jwt
+from pydantic import BaseModel
 
 # Database setup
 SQLALCHEMY_DATABASE_URL = "sqlite:///./slack_clone.db"
@@ -66,6 +67,20 @@ class DirectMessage(Base):
     sender = relationship("User", foreign_keys=[sender_id], backref="sent_direct_messages")
     recipient = relationship("User", foreign_keys=[recipient_id], backref="received_direct_messages")
 
+# Add this class for request validation
+class UserCreate(BaseModel):
+    username: str
+    email: str
+    password: str
+
+# Add this class with the other Pydantic models
+class ChannelCreate(BaseModel):
+    name: str
+    description: str
+
+# Add this Pydantic model for message creation
+class MessageCreate(BaseModel):
+    content: str
 
 # Create tables
 Base.metadata.create_all(bind=engine)
@@ -109,12 +124,19 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
 
 # User Registration
 @app.post("/register", status_code=status.HTTP_201_CREATED)
-async def register(username: str, email: str, password: str, db: Session = Depends(get_db)):
-    user = db.query(User).filter((User.username == username) | (User.email == email)).first()
-    if user:
+async def register(user: UserCreate, db: Session = Depends(get_db)):
+    existing_user = db.query(User).filter(
+        (User.username == user.username) | (User.email == user.email)
+    ).first()
+    if existing_user:
         raise HTTPException(status_code=400, detail="Username or email already registered")
-    hashed_password = get_password_hash(password)
-    new_user = User(username=username, email=email, hashed_password=hashed_password)
+    
+    hashed_password = get_password_hash(user.password)
+    new_user = User(
+        username=user.username,
+        email=user.email,
+        hashed_password=hashed_password
+    )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
@@ -158,12 +180,15 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
 # Channel endpoints
 @app.post("/channels/")
 async def create_channel(
-    name: str,
-    description: str,
+    channel: ChannelCreate,  # Changed to use Pydantic model
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    channel = Channel(name=name, description=description, created_by=current_user.id)
+    channel = Channel(
+        name=channel.name, 
+        description=channel.description, 
+        created_by=current_user.id
+    )
     db.add(channel)
     db.commit()
     db.refresh(channel)
@@ -173,18 +198,32 @@ async def create_channel(
 async def list_channels(db: Session = Depends(get_db)):
     return db.query(Channel).all()
 
+@app.get("/channels/{channel_id}/messages")
+async def get_messages(channel_id: int, db: Session = Depends(get_db)):
+    messages = db.query(Message).filter(Message.channel_id == channel_id).all()
+    return [
+        {
+            "id": msg.id,
+            "content": msg.content,
+            "sender_id": msg.sender_id,
+            "created_at": msg.created_at.isoformat(),
+        }
+        for msg in messages
+    ] or []
+
 # Message endpoints
 @app.post("/channels/{channel_id}/messages")
 async def create_message(
     channel_id: int,
-    content: str,
+    message: MessageCreate,  # Changed to use Pydantic model
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if not content or len(content.strip()) == 0:
+    if not message.content or len(message.content.strip()) == 0:
         raise HTTPException(status_code=400, detail="Message content cannot be empty")
-    if len(content) > 2000:  # Add reasonable limit
+    if len(message.content) > 2000:  # Add reasonable limit
         raise HTTPException(status_code=400, detail="Message too long")
+    
     channel = db.query(Channel).filter(Channel.id == channel_id).first()
     if not channel:
         raise HTTPException(status_code=404, detail="Channel not found")
@@ -192,7 +231,7 @@ async def create_message(
     message = Message(
         channel_id=channel_id,
         sender_id=current_user.id,
-        content=content,
+        content=message.content,
         reactions={}
     )
     db.add(message)
@@ -224,34 +263,27 @@ async def add_reaction(
 # WebSocket connection manager
 class ConnectionManager:
     def __init__(self):
-        # Separate connections for channels and direct messages
-        self.channel_connections: Dict[int, Set[WebSocket]] = {}
-        self.user_connections: Dict[int, Set[WebSocket]] = {}
+        self.active_connections: Dict[int, Set[WebSocket]] = {}
 
-    async def connect_channel(self, websocket: WebSocket, channel_id: int):
+    async def connect(self, websocket: WebSocket, channel_id: int):
         await websocket.accept()
-        if channel_id not in self.channel_connections:
-            self.channel_connections[channel_id] = set()
-        self.channel_connections[channel_id].add(websocket)
-
-    async def connect_user(self, websocket: WebSocket, user_id: int):
-        await websocket.accept()
-        if user_id not in self.user_connections:
-            self.user_connections[user_id] = set()
-        self.user_connections[user_id].add(websocket)
+        if channel_id not in self.active_connections:
+            self.active_connections[channel_id] = set()
+        self.active_connections[channel_id].add(websocket)
 
     def disconnect(self, websocket: WebSocket, channel_id: int):
         if channel_id in self.active_connections:
             self.active_connections[channel_id].remove(websocket)
+            if not self.active_connections[channel_id]:
+                del self.active_connections[channel_id]
 
     async def broadcast(self, message: dict, channel_id: int):
         if channel_id in self.active_connections:
             for connection in self.active_connections[channel_id]:
-                await connection.send_json(message)
-    
-    async def send_personal_message(self, message: dict, user_id: int):
-        if user_id in self.active_connections:
-            await self.active_connections[user_id].send_json(message)
+                try:
+                    await connection.send_json(message)
+                except WebSocketDisconnect:
+                    await self.disconnect(connection, channel_id)
 
 manager = ConnectionManager()
 
@@ -291,7 +323,7 @@ async def send_direct_message(
 async def get_direct_messages(
     recipient_username: str,
     skip: int = 0,
-    limit: int = 50,  # Default page size
+    limit: int = 50,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -314,7 +346,7 @@ async def get_direct_messages(
             "created_at": message.created_at
         }
         for message in messages
-    ]
+    ] or []
 
 
 @app.websocket("/ws/{channel_id}")
@@ -356,25 +388,20 @@ async def websocket_endpoint(
             db.commit()
             db.refresh(message)
             
-            # Broadcast message
+            # Broadcast message with all necessary fields for display
             await manager.broadcast({
                 "type": "message",
                 "message": content,
                 "message_id": message.id,
-                "sender": user.username,
+                "sender": user.username,  # Add username
+                "sender_id": user.id,     # Add sender ID
                 "channel_id": channel_id,
                 "timestamp": datetime.utcnow().isoformat(),
-                "reactions": {}
+                "reactions": message.reactions or {}
             }, channel_id)
             
     except WebSocketDisconnect:
         manager.disconnect(websocket, channel_id)
-        await manager.broadcast({
-            "type": "system_message",
-            "message": f"{user.username} has left the channel",
-            "channel_id": channel_id,
-            "timestamp": datetime.utcnow().isoformat()
-        }, channel_id)
 
 @app.websocket("/ws/direct/{recipient_username}")
 async def websocket_direct_message(

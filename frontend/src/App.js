@@ -1,23 +1,28 @@
-import logo from './logo.svg';
-import './App.css';
+import { useState } from "react";
+import Login from "./components/Login";
+import Register from "./components/Register";
+import Chat from "./components/Chat";
 
 function App() {
+  const [token, setToken] = useState(null);
+  const [isRegistering, setIsRegistering] = useState(false);
+
   return (
-    <div className="App">
-      <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
-        </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Learn React
-        </a>
-      </header>
+    <div>
+      {!token ? (
+        isRegistering ? (
+          <Register onRegister={() => setIsRegistering(false)} />
+        ) : (
+          <Login onLogin={setToken} />
+        )
+      ) : (
+        <Chat token={token} />
+      )}
+      {!token && (
+        <button onClick={() => setIsRegistering(!isRegistering)}>
+          {isRegistering ? "Back to Login" : "Register"}
+        </button>
+      )}
     </div>
   );
 }
