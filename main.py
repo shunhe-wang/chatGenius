@@ -3,18 +3,32 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, JSON
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship, Session
+from sqlalchemy.orm import sessionmaker, relationship, Session, backref
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Set
 from jose import JWTError, jwt
 from pydantic import BaseModel
+from sqlalchemy.types import TypeDecorator, JSON as SQLAlchemyJSON
+import json
+import os
 
 # Database setup
 SQLALCHEMY_DATABASE_URL = "sqlite:///./slack_clone.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL, 
+    connect_args={"check_same_thread": False}
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+# Make sure all models are defined before this line
+Base.metadata.drop_all(bind=engine)  # Drop all tables
+Base.metadata.create_all(bind=engine)  # Recreate all tables
+
+# Ensure the database file is writable
+if os.path.exists("slack_clone.db"):
+    os.chmod("slack_clone.db", 0o666)
 
 # Auth settings
 SECRET_KEY = "your-secret-key"
@@ -24,6 +38,20 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# Custom JSON type that ensures proper serialization
+class JSONType(TypeDecorator):
+    impl = SQLAlchemyJSON
+    
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return {}
+        return value
+    
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return {}
+        return value
 
 # Models
 class User(Base):
@@ -50,11 +78,15 @@ class Message(Base):
     id = Column(Integer, primary_key=True, index=True)
     channel_id = Column(Integer, ForeignKey("channels.id"))
     sender_id = Column(Integer, ForeignKey("users.id"))
+    parent_id = Column(Integer, ForeignKey("messages.id"), nullable=True)
     content = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
-    reactions = Column(JSON, default=dict)  # Store emoji reactions as {emoji: [user_ids]}
+    reactions = Column(JSONType, default=dict, nullable=False)
+    
+    # Add relationships
     channel = relationship("Channel", back_populates="messages")
     sender = relationship("User", back_populates="messages")
+    replies = relationship("Message", backref=backref("parent", remote_side=[id]))
 
 class DirectMessage(Base):
     __tablename__ = "direct_messages"
@@ -199,91 +231,136 @@ async def list_channels(db: Session = Depends(get_db)):
     return db.query(Channel).all()
 
 @app.get("/channels/{channel_id}/messages")
-async def get_messages(channel_id: int, db: Session = Depends(get_db)):
+async def get_messages(
+    channel_id: int, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     messages = db.query(Message).filter(Message.channel_id == channel_id).all()
-    return [
-        {
+    print(f"Fetching messages for channel {channel_id}")
+    response_messages = []
+    for msg in messages:
+        print(f"Message {msg.id} reactions: {msg.reactions}")
+        response_messages.append({
             "id": msg.id,
             "content": msg.content,
             "sender_id": msg.sender_id,
             "created_at": msg.created_at.isoformat(),
-        }
-        for msg in messages
-    ] or []
+            "reactions": msg.reactions or {}
+        })
+    return response_messages
 
 # Message endpoints
 @app.post("/channels/{channel_id}/messages")
 async def create_message(
     channel_id: int,
-    message: MessageCreate,  # Changed to use Pydantic model
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    message: MessageCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
-    if not message.content or len(message.content.strip()) == 0:
-        raise HTTPException(status_code=400, detail="Message content cannot be empty")
-    if len(message.content) > 2000:  # Add reasonable limit
-        raise HTTPException(status_code=400, detail="Message too long")
-    
-    channel = db.query(Channel).filter(Channel.id == channel_id).first()
-    if not channel:
-        raise HTTPException(status_code=404, detail="Channel not found")
-        
-    message = Message(
+    db_message = Message(
+        content=message.content,
         channel_id=channel_id,
         sender_id=current_user.id,
-        content=message.content,
         reactions={}
     )
-    db.add(message)
+    db.add(db_message)
     db.commit()
-    db.refresh(message)
-    return message
+    db.refresh(db_message)
+    
+    # Broadcast the new message
+    await manager.broadcast({
+        "type": "new_message",
+        "message": {
+            "id": db_message.id,
+            "content": db_message.content,
+            "sender_id": db_message.sender_id,
+            "created_at": db_message.created_at.isoformat(),
+            "reactions": db_message.reactions
+        }
+    }, channel_id)
+    
+    return db_message
 
-@app.post("/messages/{message_id}/react")
+@app.post("/messages/{message_id}/reactions")
 async def add_reaction(
     message_id: int,
     emoji: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    message = db.query(Message).filter(Message.id == message_id).first()
+    print(f"Received reaction request: message_id={message_id}, emoji={emoji}, user_id={current_user.id}")
+    
+    # Get message with a write lock
+    message = db.query(Message).with_for_update().filter(Message.id == message_id).first()
     if not message:
         raise HTTPException(status_code=404, detail="Message not found")
     
-    reactions = message.reactions or {}
-    if emoji not in reactions:
-        reactions[emoji] = []
-    if current_user.id not in reactions[emoji]:
-        reactions[emoji].append(current_user.id)
+    print(f"Current message reactions: {message.reactions}")
     
-    message.reactions = reactions
-    db.commit()
-    return {"message": "Reaction added successfully"}
+    # Ensure reactions is a dict
+    if message.reactions is None:
+        message.reactions = {}
+    
+    # Initialize emoji array if not exists
+    if emoji not in message.reactions:
+        message.reactions[emoji] = []
+    
+    # Toggle reaction
+    if current_user.id in message.reactions[emoji]:
+        message.reactions[emoji].remove(current_user.id)
+    else:
+        message.reactions[emoji].append(current_user.id)
+    
+    # Clean up empty reactions
+    if not message.reactions[emoji]:
+        del message.reactions[emoji]
+    
+    print(f"Updated reactions: {message.reactions}")
+    
+    # Force the column to update
+    db.query(Message).filter(Message.id == message_id).update(
+        {"reactions": message.reactions},
+        synchronize_session=False
+    )
+    
+    try:
+        db.commit()
+        print("Database committed successfully")
+    except Exception as e:
+        print(f"Error committing to database: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to save reaction")
+    
+    return {
+        "message_id": message_id,
+        "reactions": message.reactions
+    }
 
 # WebSocket connection manager
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Dict[int, Set[WebSocket]] = {}
-
-    async def connect(self, websocket: WebSocket, channel_id: int):
+        self.active_connections: Dict[WebSocket, Set[int]] = {}
+        
+    async def connect(self, websocket: WebSocket):
         await websocket.accept()
-        if channel_id not in self.active_connections:
-            self.active_connections[channel_id] = set()
-        self.active_connections[channel_id].add(websocket)
-
-    def disconnect(self, websocket: WebSocket, channel_id: int):
-        if channel_id in self.active_connections:
-            self.active_connections[channel_id].remove(websocket)
-            if not self.active_connections[channel_id]:
-                del self.active_connections[channel_id]
-
+        self.active_connections[websocket] = set()
+        
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            del self.active_connections[websocket]
+            
+    async def subscribe(self, websocket: WebSocket, channel_id: int):
+        if websocket in self.active_connections:
+            self.active_connections[websocket].add(channel_id)
+            
     async def broadcast(self, message: dict, channel_id: int):
-        if channel_id in self.active_connections:
-            for connection in self.active_connections[channel_id]:
+        for connection, channels in self.active_connections.items():
+            if channel_id in channels:
                 try:
-                    await connection.send_json(message)
-                except WebSocketDisconnect:
-                    await self.disconnect(connection, channel_id)
+                    await connection.send_text(json.dumps(message))
+                except:
+                    pass
 
 manager = ConnectionManager()
 
@@ -349,59 +426,21 @@ async def get_direct_messages(
     ] or []
 
 
-@app.websocket("/ws/{channel_id}")
-async def websocket_endpoint(
-    websocket: WebSocket,
-    channel_id: int,
-    token: str = None,
-    db: Session = Depends(get_db)
-):
-    if not token:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        user = db.query(User).filter(User.username == username).first()
-        if not user:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-    except JWTError:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-
-    await manager.connect(websocket, channel_id)
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, token: str = None):
+    await manager.connect(websocket)
     try:
         while True:
-            data = await websocket.receive_json()
-            content = data.get("content")
+            data = await websocket.receive_text()
+            message = json.loads(data)
             
-            # Save message to database
-            message = Message(
-                channel_id=channel_id,
-                sender_id=user.id,
-                content=content,
-                reactions={}
-            )
-            db.add(message)
-            db.commit()
-            db.refresh(message)
+            if message["type"] == "subscribe":
+                await manager.subscribe(websocket, message["channel_id"])
             
-            # Broadcast message with all necessary fields for display
-            await manager.broadcast({
-                "type": "message",
-                "message": content,
-                "message_id": message.id,
-                "sender": user.username,  # Add username
-                "sender_id": user.id,     # Add sender ID
-                "channel_id": channel_id,
-                "timestamp": datetime.utcnow().isoformat(),
-                "reactions": message.reactions or {}
-            }, channel_id)
-            
-    except WebSocketDisconnect:
-        manager.disconnect(websocket, channel_id)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+    finally:
+        manager.disconnect(websocket)
 
 @app.websocket("/ws/direct/{recipient_username}")
 async def websocket_direct_message(
@@ -458,3 +497,52 @@ async def websocket_direct_message(
             }, recipient.id)
     except WebSocketDisconnect:
         manager.disconnect(user.id)
+
+# Add endpoint to get thread messages
+@app.get("/messages/{message_id}/thread")
+async def get_thread_messages(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    messages = db.query(Message).filter(Message.parent_id == message_id).all()
+    return messages
+
+# Update create message endpoint to support threads
+@app.post("/messages/{parent_id}/reply")
+async def create_reply(
+    parent_id: int,
+    message: MessageCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Verify parent message exists
+    parent = db.query(Message).filter(Message.id == parent_id).first()
+    if not parent:
+        raise HTTPException(status_code=404, detail="Parent message not found")
+
+    db_message = Message(
+        content=message.content,
+        channel_id=parent.channel_id,
+        sender_id=current_user.id,
+        parent_id=parent_id,
+        reactions={}
+    )
+    db.add(db_message)
+    db.commit()
+    db.refresh(db_message)
+    
+    # Broadcast the new reply
+    await manager.broadcast({
+        "type": "new_reply",
+        "parent_id": parent_id,
+        "message": {
+            "id": db_message.id,
+            "content": db_message.content,
+            "sender_id": db_message.sender_id,
+            "created_at": db_message.created_at.isoformat(),
+            "reactions": db_message.reactions
+        }
+    }, parent.channel_id)
+    
+    return db_message
